@@ -62,6 +62,10 @@ from .conv import (
     RepConv,
     SpatialAttention,
     SimAM,
+    MHSA,
+    ResBlock_CBAM,
+    GAM_Attention,
+    ShuffleAttention,
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect
 from .transformer import (
@@ -137,4 +141,8 @@ __all__ = (
     "CBLinear",
     "Silence",
     "SimAM",
+    "GAM_Attention",
+    "MHSA",
+    "ResBlock_CBAM",
+    "ShuffleAttention",
 )

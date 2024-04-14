@@ -6,6 +6,9 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+from torch import channel_shuffle
+from torch.nn import init
+from torch.nn.parameter import Parameter
 
 __all__ = (
     "Conv",
@@ -21,8 +24,14 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
-    "SimAM"
+    "SimAM",
+    "MHSA",
+    "ShuffleAttention",
+    "GAM_Attention",
+    "ResBlock_CBAM",
 )
+
+from torch.nn import Parameter, init
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -359,3 +368,186 @@ class SimAM(torch.nn.Module):
         y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
 
         return x * self.activaton(y)
+
+
+class MHSA(nn.Module):
+    def __init__(self, n_dims, width=14, height=14, heads=4, pos_emb=False):
+        super(MHSA, self).__init__()
+
+        self.heads = heads
+        self.query = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+        self.key = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+        self.value = nn.Conv2d(n_dims, n_dims, kernel_size=1)
+        self.pos = pos_emb
+        if self.pos:
+            self.rel_h_weight = nn.Parameter(torch.randn([1, heads, (n_dims) // heads, 1, int(height)]),
+                                             requires_grad=True)
+            self.rel_w_weight = nn.Parameter(torch.randn([1, heads, (n_dims) // heads, int(width), 1]),
+                                             requires_grad=True)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        n_batch, C, width, height = x.size()
+        q = self.query(x).view(n_batch, self.heads, C // self.heads, -1)
+        k = self.key(x).view(n_batch, self.heads, C // self.heads, -1)
+        v = self.value(x).view(n_batch, self.heads, C // self.heads, -1)
+        content_content = torch.matmul(q.permute(0, 1, 3, 2), k)  # 1,C,h*w,h*w
+        c1, c2, c3, c4 = content_content.size()
+        if self.pos:
+            content_position = (self.rel_h_weight + self.rel_w_weight).view(1, self.heads, C // self.heads, -1).permute(
+                0, 1, 3, 2)  # 1,4,1024,64
+
+            content_position = torch.matmul(content_position, q)  # ([1, 4, 1024, 256])
+            content_position = content_position if (
+                    content_content.shape == content_position.shape) else content_position[:, :, :c3, ]
+            assert (content_content.shape == content_position.shape)
+            energy = content_content + content_position
+        else:
+            energy = content_content
+        attention = self.softmax(energy)
+        out = torch.matmul(v, attention.permute(0, 1, 3, 2))  # 1,4,256,64
+        out = out.view(n_batch, C, width, height)
+        return out
+
+
+class ResBlock_CBAM(nn.Module):
+    def __init__(self, in_places, places, stride=1, downsampling=False, expansion=1):
+        super(ResBlock_CBAM, self).__init__()
+        self.expansion = expansion
+        self.downsampling = downsampling
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels=in_places, out_channels=places, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(places),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_channels=places, out_channels=places, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(places),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_channels=places, out_channels=places * self.expansion, kernel_size=1, stride=1,
+                      bias=False),
+            nn.BatchNorm2d(places * self.expansion),
+        )
+        # self.cbam = CBAM(c1=places * self.expansion, c2=places * self.expansion, )
+        self.cbam = CBAM(c1=places * self.expansion)
+
+        if self.downsampling:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels=in_places, out_channels=places * self.expansion, kernel_size=1, stride=stride,
+                          bias=False),
+                nn.BatchNorm2d(places * self.expansion)
+            )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = x
+        out = self.bottleneck(x)
+        out = self.cbam(out)
+        if self.downsampling:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class ShuffleAttention(nn.Module):
+
+    def __init__(self, channel=512, reduction=16, G=8):
+        super().__init__()
+        self.G = G
+        self.channel = channel
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.gn = nn.GroupNorm(channel // (2 * G), channel // (2 * G))
+        self.cweight = Parameter(torch.zeros(1, channel // (2 * G), 1, 1))
+        self.cbias = Parameter(torch.ones(1, channel // (2 * G), 1, 1))
+        self.sweight = Parameter(torch.zeros(1, channel // (2 * G), 1, 1))
+        self.sbias = Parameter(torch.ones(1, channel // (2 * G), 1, 1))
+        self.sigmoid = nn.Sigmoid()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+
+        return x
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        # group into subfeatures
+        x = x.view(b * self.G, -1, h, w)  # bs*G,c//G,h,w
+
+        # channel_split
+        x_0, x_1 = x.chunk(2, dim=1)  # bs*G,c//(2*G),h,w
+
+        # channel attention
+        x_channel = self.avg_pool(x_0)  # bs*G,c//(2*G),1,1
+        x_channel = self.cweight * x_channel + self.cbias  # bs*G,c//(2*G),1,1
+        x_channel = x_0 * self.sigmoid(x_channel)
+
+        # spatial attention
+        x_spatial = self.gn(x_1)  # bs*G,c//(2*G),h,w
+        x_spatial = self.sweight * x_spatial + self.sbias  # bs*G,c//(2*G),h,w
+        x_spatial = x_1 * self.sigmoid(x_spatial)  # bs*G,c//(2*G),h,w
+
+        # concatenate along channel axis
+        out = torch.cat([x_channel, x_spatial], dim=1)  # bs*G,c//G,h,w
+        out = out.contiguous().view(b, -1, h, w)
+
+        # channel shuffle
+        out = self.channel_shuffle(out, 2)
+        return out
+
+class GAM_Attention(nn.Module):
+    def __init__(self, c1, c2, group=True, rate=4):
+        super(GAM_Attention, self).__init__()
+
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c1, int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(c1 / rate), c1)
+        )
+
+        self.spatial_attention = nn.Sequential(
+
+            nn.Conv2d(c1, c1 // rate, kernel_size=7, padding=3, groups=rate) if group else nn.Conv2d(c1, int(c1 / rate),
+                                                                                                     kernel_size=7,
+                                                                                                     padding=3),
+            nn.BatchNorm2d(int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1 // rate, c2, kernel_size=7, padding=3, groups=rate) if group else nn.Conv2d(int(c1 / rate), c2,
+                                                                                                     kernel_size=7,
+                                                                                                     padding=3),
+            nn.BatchNorm2d(c2)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2)
+        # x_channel_att=channel_shuffle(x_channel_att,4) #last shuffle
+        x = x * x_channel_att
+
+        x_spatial_att = self.spatial_attention(x).sigmoid()
+        x_spatial_att = channel_shuffle(x_spatial_att, 4)  # last shuffle
+        out = x * x_spatial_att
+        # out=channel_shuffle(out,4) #last shuffle
+        return out
